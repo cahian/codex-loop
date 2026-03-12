@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+from typing import List, Tuple
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Ex.: "- [P1] ..." ou "* [P2] ..."
+FINDING_RE = re.compile(r"(?m)^\s*[-*]\s*\[P\d+\]\s+")
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s or "")
+
+
+def stream_and_capture(cmd: List[str]) -> Tuple[int, str]:
+    """
+    Roda um comando e:
+      - mostra a saída em tempo real no terminal
+      - captura a saída (stdout + stderr juntos) pra análise depois
+    """
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    out_lines: list[str] = []
+    assert p.stdout is not None
+    for line in p.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        out_lines.append(line)
+
+    rc = p.wait()
+    return rc, "".join(out_lines)
+
+
+def extract_review_section(full_output: str) -> str:
+    """
+    Tenta pegar só a parte "útil" do review (onde aparecem os findings).
+    Se não achar, volta o texto todo.
+    """
+    t = strip_ansi(full_output).strip()
+
+    markers = [
+        "Full review comments:",
+        "Review comments:",
+        "Full Review comments:",
+        "Comentários do review:",
+        "Comentários completos:",
+    ]
+    for m in markers:
+        idx = t.rfind(m)
+        if idx != -1:
+            return t[idx:].strip()
+
+    # fallback: começa na 1a linha com "- [P1]" etc.
+    m = FINDING_RE.search(t)
+    if m:
+        return t[m.start():].strip()
+
+    return t
+
+
+def needs_fix(review_section: str) -> bool:
+    return bool(FINDING_RE.search(strip_ansi(review_section)))
+
+
+def build_fix_prompt(review_text: str) -> str:
+    return textwrap.dedent(f"""\
+    Você é um engenheiro sênior. Corrija TODOS os itens acionáveis do review abaixo.
+
+    Restrições:
+    - Faça mudanças mínimas e focadas (sem refactors/reformatações não relacionadas).
+    - NÃO faça commit, push, rebase, nem mexa no histórico do git.
+    - Se existir no projeto e fizer sentido, rode verificações rápidas (ex.: testes/lint),
+      mas NÃO instale dependências nem exija rede.
+
+    Review a corrigir:
+    === BEGIN_REVIEW ===
+    {review_text.strip()}
+    === END_REVIEW ===
+    """)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="codex-loop")
+    ap.add_argument("--max-iters", type=int, default=8)
+    ap.add_argument("--model", default=None, help="Ex.: gpt-5.1-codex-max, o3, etc.")
+    ap.add_argument("--show-extracted", action="store_true", help="Mostra a seção extraída do review (pra debug).")
+    args = ap.parse_args()
+
+    if not shutil.which("codex"):
+        print("Erro: não encontrei `codex` no PATH.", file=sys.stderr)
+        return 127
+
+    for it in range(1, args.max_iters + 1):
+        print(f"\n========== ITERAÇÃO {it}/{args.max_iters} — REVIEW (default) ==========")
+
+        review_cmd = ["codex", "exec", "review", "--uncommitted"]
+        if args.model:
+            review_cmd += ["--model", args.model]
+
+        rc, full_out = stream_and_capture(review_cmd)
+        if rc != 0:
+            print(f"\nReview falhou (exit code {rc}).", file=sys.stderr)
+            return rc
+
+        review_section = extract_review_section(full_out)
+
+        if args.show_extracted:
+            print("\n---------- REVIEW (extraído) ----------")
+            print(review_section)
+            print("---------- /REVIEW (extraído) ---------\n")
+
+        if not needs_fix(review_section):
+            print("\n✅ Nada a corrigir (nenhum '- [P#]' encontrado). Encerrando.")
+            return 0
+
+        print(f"\n========== ITERAÇÃO {it}/{args.max_iters} — FIX ==========")
+        fix_prompt = build_fix_prompt(review_section)
+
+        fix_cmd = ["codex", "exec", "--full-auto", fix_prompt]
+        if args.model:
+            fix_cmd = ["codex", "exec", "--full-auto", "--model", args.model, fix_prompt]
+
+        # FIX já vai streamar porque herda stdout/stderr
+        rc = subprocess.run(fix_cmd).returncode
+        if rc != 0:
+            print(f"\nFix falhou (exit code {rc}).", file=sys.stderr)
+            return rc
+
+    print(f"\n🛑 Cheguei em {args.max_iters} iterações e ainda tem findings.")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
